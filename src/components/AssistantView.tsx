@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   MessageSquareText,
   Send,
@@ -33,6 +33,14 @@ interface AssistantViewProps {
   onOpenEmergency: () => void;
 }
 
+const SAMPLE_QUESTIONS = [
+  'My landlord has not returned my ₹50,000 security deposit. What options do I have?',
+  'What should I do after receiving an employment termination notice without severance?',
+  'What does Section 27 of the Indian Contract Act mean regarding non-compete clauses?',
+  'The brand refuses to repair or refund my defective refrigerator after 2 weeks. What are my consumer rights?',
+  'What documents and evidence should I collect before sending a formal legal notice?',
+] as const;
+
 export const AssistantView: React.FC<AssistantViewProps> = ({ jurisdiction, onOpenEmergency }) => {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -50,19 +58,11 @@ export const AssistantView: React.FC<AssistantViewProps> = ({ jurisdiction, onOp
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  const sampleQuestions = [
-    'My landlord has not returned my ₹50,000 security deposit. What options do I have?',
-    'What should I do after receiving an employment termination notice without severance?',
-    'What does Section 27 of the Indian Contract Act mean regarding non-compete clauses?',
-    'The brand refuses to repair or refund my defective refrigerator after 2 weeks. What are my consumer rights?',
-    'What documents and evidence should I collect before sending a formal legal notice?',
-  ];
-
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isLoading]);
 
-  const handleSend = async (questionToSend?: string) => {
+  const handleSend = useCallback(async (questionToSend?: string) => {
     const q = (questionToSend || inputText).trim();
     if (!q || isLoading) return;
 
@@ -86,7 +86,7 @@ export const AssistantView: React.FC<AssistantViewProps> = ({ jurisdiction, onOp
     try {
       const historyPayload = messages
         .filter((m) => m.text)
-        .slice(-4)
+        .slice(-2)
         .map((m) => ({
           role: m.sender === 'user' ? ('user' as const) : ('assistant' as const),
           content: m.text || '',
@@ -114,7 +114,7 @@ export const AssistantView: React.FC<AssistantViewProps> = ({ jurisdiction, onOp
       setIsLoading(false);
       setTimeout(() => inputRef.current?.focus(), 100);
     }
-  };
+  }, [inputText, isLoading, messages, jurisdiction, onOpenEmergency]);
 
   const toggleCheck = (id: string) => {
     setCheckedSteps((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -168,7 +168,7 @@ export const AssistantView: React.FC<AssistantViewProps> = ({ jurisdiction, onOp
           Suggested Legal Questions:
         </span>
         <div className="flex flex-wrap gap-2">
-          {sampleQuestions.map((q, idx) => (
+          {SAMPLE_QUESTIONS.map((q, idx) => (
             <button
               key={idx}
               onClick={() => handleSend(q)}

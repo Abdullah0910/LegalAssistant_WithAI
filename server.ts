@@ -1,4 +1,5 @@
 import express from 'express';
+import compression from 'compression';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -16,6 +17,14 @@ const __dirname = path.dirname(__filename);
 async function createServer() {
   const app = express();
   const isProd = process.env.NODE_ENV === 'production';
+
+  // High-efficiency response compression (gzip / deflate)
+  app.use(
+    compression({
+      threshold: 1024,
+      level: 6,
+    })
+  );
 
   // Body parser with 15MB limit for document uploads
   app.use(express.json({ limit: '15mb' }));
@@ -40,11 +49,19 @@ async function createServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // Production mode: Serve built static assets from dist
+    // Production mode: Serve built static assets from dist with long-term immutable caching
     const distPath = path.resolve(__dirname, 'dist');
     if (fs.existsSync(distPath)) {
-      app.use(express.static(distPath));
+      app.use(
+        express.static(distPath, {
+          maxAge: '1y',
+          etag: true,
+          immutable: true,
+          index: false,
+        })
+      );
       app.get('*', (req, res) => {
+        res.setHeader('Cache-Control', 'no-cache');
         res.sendFile(path.resolve(distPath, 'index.html'));
       });
     } else {

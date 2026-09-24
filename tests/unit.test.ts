@@ -83,3 +83,50 @@ describe('Unit Tests: Authoritative Legal Sources Registry', () => {
     expect(numbers).toContain('15100');
   });
 });
+
+describe('Unit Tests: Efficiency, Cache & Performance Observability', () => {
+  it('should store and retrieve cached items within TTL', async () => {
+    const { ResponseCache } = await import('../server/services/cacheService.js');
+    const testCache = new ResponseCache<string>(5000, 5);
+    testCache.set('k1', 'val1');
+    expect(testCache.get('k1')).toBe('val1');
+    expect(testCache.has('k1')).toBe(true);
+    expect(testCache.get('missing_key')).toBeNull();
+  });
+
+  it('should enforce max entries via LRU eviction preventing memory bloat', async () => {
+    const { ResponseCache } = await import('../server/services/cacheService.js');
+    const smallCache = new ResponseCache<number>(10000, 3);
+    smallCache.set('item1', 1);
+    smallCache.set('item2', 2);
+    smallCache.set('item3', 3);
+    expect(smallCache.size()).toBe(3);
+
+    // Adding 4th item should evict oldest item1
+    smallCache.set('item4', 4);
+    expect(smallCache.size()).toBe(3);
+    expect(smallCache.get('item1')).toBeNull();
+    expect(smallCache.get('item4')).toBe(4);
+  });
+
+  it('should track AI metrics and cache hit rates accurately', async () => {
+    const { Metrics } = await import('../server/services/metrics.js');
+    Metrics.recordAICall(150, false);
+    Metrics.recordAICall(0, true);
+    const summary = Metrics.getSummary();
+    expect(summary.ai.totalRequests).toBeGreaterThanOrEqual(2);
+    expect(summary.ai.cacheHits).toBeGreaterThanOrEqual(1);
+  });
+
+  it('should extract relevant document context chunking without sending full massive document', async () => {
+    const { extractRelevantDocumentContext } = await import('../server/services/aiService.js');
+    const hugeDoc = Array(100).fill('Standard clause paragraph regarding general conditions.\n\n').join('') +
+      'SPECIAL NOTICE: Tenant must pay security deposit of INR 50,000 on or before 1st April.\n\n' +
+      Array(100).fill('Other generic boilerplate contract terms.\n\n').join('');
+
+    const res = extractRelevantDocumentContext(hugeDoc, 'security deposit refund notice', 4000);
+    expect(res.isFiltered).toBe(true);
+    expect(res.context.length).toBeLessThanOrEqual(4500);
+    expect(res.context.toLowerCase()).toContain('security deposit');
+  });
+});

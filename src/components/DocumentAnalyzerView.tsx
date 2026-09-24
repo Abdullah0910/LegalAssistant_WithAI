@@ -27,6 +27,27 @@ interface DocumentAnalyzerViewProps {
   onAnnounce?: (message: string) => void;
 }
 
+const getClauseBadgeStyle = (label: string): string => {
+  switch (label) {
+    case 'Important Date':
+      return 'bg-purple-100 text-purple-800 border-purple-200';
+    case 'Payment Obligation':
+      return 'bg-emerald-100 text-emerald-800 border-emerald-200';
+    case 'Termination Clause':
+      return 'bg-red-100 text-red-800 border-red-200';
+    case 'Notice Requirement':
+      return 'bg-amber-100 text-amber-800 border-amber-200';
+    case 'Potentially Important Clause':
+      return 'bg-blue-100 text-blue-800 border-blue-200';
+    case 'Dispute Resolution':
+      return 'bg-indigo-100 text-indigo-800 border-indigo-200';
+    case 'Liability / Indemnity':
+      return 'bg-orange-100 text-orange-800 border-orange-200';
+    default:
+      return 'bg-slate-100 text-slate-800 border-slate-200';
+  }
+};
+
 export const DocumentAnalyzerView: React.FC<DocumentAnalyzerViewProps> = ({
   jurisdiction,
   selectedSampleDocId,
@@ -180,27 +201,6 @@ export const DocumentAnalyzerView: React.FC<DocumentAnalyzerViewProps> = ({
       ]);
     } finally {
       setIsQaLoading(false);
-    }
-  };
-
-  const getClauseBadgeStyle = (label: string) => {
-    switch (label) {
-      case 'Important Date':
-        return 'bg-purple-100 text-purple-800 border-purple-200';
-      case 'Payment Obligation':
-        return 'bg-emerald-100 text-emerald-800 border-emerald-200';
-      case 'Termination Clause':
-        return 'bg-red-100 text-red-800 border-red-200';
-      case 'Notice Requirement':
-        return 'bg-amber-100 text-amber-800 border-amber-200';
-      case 'Potentially Important Clause':
-        return 'bg-blue-100 text-blue-800 border-blue-200';
-      case 'Dispute Resolution':
-        return 'bg-indigo-100 text-indigo-800 border-indigo-200';
-      case 'Liability / Indemnity':
-        return 'bg-orange-100 text-orange-800 border-orange-200';
-      default:
-        return 'bg-slate-100 text-slate-800 border-slate-200';
     }
   };
 

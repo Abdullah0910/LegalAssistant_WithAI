@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   BookOpen,
   ExternalLink,
@@ -16,46 +16,56 @@ interface ResourcesDirectoryViewProps {
   jurisdiction: string;
 }
 
+const CATEGORIES = [
+  'All',
+  'Consumer',
+  'Rental / Housing',
+  'Employment',
+  'Legal Aid',
+  'General / Legislation',
+  'Cybercrime',
+  'Civil / Criminal',
+] as const;
+
 export const ResourcesDirectoryView: React.FC<ResourcesDirectoryViewProps> = ({ jurisdiction }) => {
   const [sources, setSources] = useState<LegalSource[]>([]);
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
-  const categories = [
-    'All',
-    'Consumer',
-    'Rental / Housing',
-    'Employment',
-    'Legal Aid',
-    'General / Legislation',
-    'Cybercrime',
-    'Civil / Criminal',
-  ];
-
   useEffect(() => {
-    loadResources();
+    const controller = new AbortController();
+    setIsLoading(true);
+
+    api
+      .getResources(jurisdiction, selectedCategory, controller.signal)
+      .then((res) => {
+        setSources(res.sources || []);
+      })
+      .catch((err) => {
+        if (err.name !== 'AbortError') {
+          console.error('Failed to load resources:', err);
+        }
+      })
+      .finally(() => {
+        setIsLoading(false);
+      });
+
+    return () => controller.abort();
   }, [jurisdiction, selectedCategory]);
 
-  const loadResources = async () => {
-    setIsLoading(true);
-    try {
-      const res = await api.getResources(jurisdiction, selectedCategory);
-      setSources(res.sources || []);
-    } catch (err) {
-      console.error('Failed to load resources:', err);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  const filteredSources = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return sources;
 
-  const filteredSources = sources.filter((s) => {
-    const matchesSearch =
-      s.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.description.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (s.relevantProvision && s.relevantProvision.toLowerCase().includes(searchQuery.toLowerCase()));
-    return matchesSearch;
-  });
+    return sources.filter((s) => {
+      return (
+        s.name.toLowerCase().includes(q) ||
+        s.description.toLowerCase().includes(q) ||
+        (s.relevantProvision && s.relevantProvision.toLowerCase().includes(q))
+      );
+    });
+  }, [sources, searchQuery]);
 
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
@@ -73,7 +83,7 @@ export const ResourcesDirectoryView: React.FC<ResourcesDirectoryViewProps> = ({ 
       <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center justify-between">
         {/* Categories segmented buttons */}
         <div className="flex flex-wrap gap-1 p-1 bg-slate-100 rounded-xl border border-slate-200">
-          {categories.map((cat) => (
+          {CATEGORIES.map((cat) => (
             <button
               key={cat}
               onClick={() => setSelectedCategory(cat)}

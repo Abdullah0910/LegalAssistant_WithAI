@@ -1,6 +1,18 @@
 import { GoogleGenAI, Type } from '@google/genai';
 import { CONFIG } from '../config.js';
 import { getSourcesForQuery, LegalSource } from './legalSources.js';
+import {
+  assistantCache,
+  documentAnalysisCache,
+  issueClassificationCache,
+  documentQACache,
+  ResponseCache,
+} from './cacheService.js';
+import { Metrics } from './metrics.js';
+import { seedDefaultCaches } from './seedCache.js';
+
+// Pre-seed caches with high-value demo documents and canonical legal scenarios
+seedDefaultCaches();
 
 // Initialize Gemini Client
 const ai = new GoogleGenAI({
@@ -11,6 +23,86 @@ const ai = new GoogleGenAI({
     },
   },
 });
+
+/**
+ * Execute Gemini API call with strict timeout and limited exponential backoff
+ */
+async function callGeminiWithTimeout<T>(
+  requestFn: () => Promise<T>,
+  timeoutMs: number = CONFIG.AI_TIMEOUT_MS,
+  maxRetries: number = CONFIG.MAX_RETRIES
+): Promise<T> {
+  let attempt = 0;
+  while (attempt <= maxRetries) {
+    try {
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`AI service timeout after ${timeoutMs}ms`));
+        }, timeoutMs);
+        if (typeof timer.unref === 'function') timer.unref();
+      });
+
+      return await Promise.race([requestFn(), timeoutPromise]);
+    } catch (err: any) {
+      attempt++;
+      // Only retry once on transient rate limit or 503 errors
+      const isTransient = err?.status === 503 || err?.status === 429 || err?.message?.includes('high demand') || err?.message?.includes('timeout');
+      if (attempt <= maxRetries && isTransient) {
+        const backoffMs = Math.min(400 * Math.pow(1.5, attempt), 1000);
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('AI service max retries exceeded');
+}
+
+/**
+ * Extract relevant document excerpt for Q&A without sending massive document
+ */
+export function extractRelevantDocumentContext(documentText: string, query: string, maxChars: number = 8000): { context: string; isFiltered: boolean } {
+  if (documentText.length <= maxChars) {
+    return { context: documentText, isFiltered: false };
+  }
+
+  const queryWords = query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .split(/\s+/)
+    .filter((w) => w.length > 3 && !['what', 'when', 'where', 'which', 'about', 'does', 'this', 'that', 'have', 'from', 'with'].includes(w));
+
+  // Split document into paragraphs or sections
+  const sections = documentText.split(/\n\s*\n+/);
+  const scoredSections: Array<{ section: string; score: number; index: number }> = [];
+
+  sections.forEach((sec, index) => {
+    let score = 0;
+    const secLower = sec.toLowerCase();
+    for (const word of queryWords) {
+      if (secLower.includes(word)) score += 2;
+    }
+    // High priority clauses
+    if (/clause|section|notice|deposit|terminat|payment|refund|penalty|jurisdiction/i.test(sec)) {
+      score += 1;
+    }
+    scoredSections.push({ section: sec, score, index });
+  });
+
+  // Sort by score and preserve narrative order
+  scoredSections.sort((a, b) => b.score - a.score);
+  const topSections = scoredSections.slice(0, 8);
+  topSections.sort((a, b) => a.index - b.index);
+
+  const selectedText = topSections.map((s) => s.section).join('\n\n');
+  if (selectedText.length > 0) {
+    const trimmed = selectedText.length > maxChars ? selectedText.substring(0, maxChars) + '\n[...section excerpt...]' : selectedText;
+    return { context: trimmed, isFiltered: true };
+  }
+
+  // Fallback to first maxChars if no keyword overlap
+  return { context: documentText.substring(0, maxChars) + '\n[...excerpt truncated for relevance...]', isFiltered: true };
+}
 
 export interface AssistantChatResponse {
   understanding: string;
@@ -127,16 +219,33 @@ export async function chatLegalAssistant(
   history: Array<{ role: 'user' | 'assistant'; content: string }> = []
 ): Promise<AssistantChatResponse> {
   const verifiedSources = getSourcesForQuery(jurisdiction);
+  const cacheKey = ResponseCache.generateKey('assistant', { question: question.trim().toLowerCase(), jurisdiction });
+
+  const cached = assistantCache.get(cacheKey);
+  if (cached) {
+    Metrics.recordAICall(0, true);
+    return cached;
+  }
+
+  const startTime = Date.now();
+
   const sourcesSummary = verifiedSources
     .slice(0, 4)
     .map((s) => `- ${s.name} (${s.relevantProvision || 'General'}): ${s.url}`)
     .join('\n');
+
+  // Token optimization: preserve only the latest 2 conversation turns
+  const trimmedHistory = history.slice(-2);
+  const historyText = trimmedHistory.length > 0
+    ? '\nRECENT RELEVANT CONTEXT:\n' + trimmedHistory.map((h) => `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.content.substring(0, 300)}`).join('\n')
+    : '';
 
   const prompt = `
 JURISDICTION: ${jurisdiction}
 
 VERIFIED OFFICIAL SOURCES AVAILABLE:
 ${sourcesSummary}
+${historyText}
 
 USER INQUIRY:
 "${question}"
@@ -151,94 +260,99 @@ Include a standard legal information disclaimer.
 `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: CONFIG.DEFAULT_MODEL,
-      contents: prompt,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION_CORE,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            understanding: { type: Type.STRING },
-            relevantLegalConcepts: {
-              type: Type.ARRAY,
-              items: {
+    const response = await callGeminiWithTimeout(async () => {
+      return await ai.models.generateContent({
+        model: CONFIG.DEFAULT_MODEL,
+        contents: prompt,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION_CORE,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              understanding: { type: Type.STRING },
+              relevantLegalConcepts: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    concept: { type: Type.STRING },
+                    statuteOrRule: { type: Type.STRING },
+                    explanation: { type: Type.STRING },
+                  },
+                  required: ['concept', 'statuteOrRule', 'explanation'],
+                },
+              },
+              possibleNextSteps: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    stepNumber: { type: Type.INTEGER },
+                    title: { type: Type.STRING },
+                    description: { type: Type.STRING },
+                    priority: { type: Type.STRING },
+                  },
+                  required: ['stepNumber', 'title', 'description', 'priority'],
+                },
+              },
+              documentsToCollect: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    documentName: { type: Type.STRING },
+                    purpose: { type: Type.STRING },
+                    whereToObtain: { type: Type.STRING },
+                  },
+                  required: ['documentName', 'purpose', 'whereToObtain'],
+                },
+              },
+              importantConsiderations: {
                 type: Type.OBJECT,
                 properties: {
-                  concept: { type: Type.STRING },
-                  statuteOrRule: { type: Type.STRING },
-                  explanation: { type: Type.STRING },
+                  deadlines: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  jurisdictionNotes: { type: Type.STRING },
+                  uncertaintyFactors: { type: Type.ARRAY, items: { type: Type.STRING } },
                 },
-                required: ['concept', 'statuteOrRule', 'explanation'],
+                required: ['deadlines', 'jurisdictionNotes', 'uncertaintyFactors'],
               },
-            },
-            possibleNextSteps: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  stepNumber: { type: Type.INTEGER },
-                  title: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  priority: { type: Type.STRING },
+              sources: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    name: { type: Type.STRING },
+                    provision: { type: Type.STRING },
+                    url: { type: Type.STRING },
+                    note: { type: Type.STRING },
+                  },
+                  required: ['name', 'provision', 'url', 'note'],
                 },
-                required: ['stepNumber', 'title', 'description', 'priority'],
               },
+              disclaimer: { type: Type.STRING },
             },
-            documentsToCollect: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  documentName: { type: Type.STRING },
-                  purpose: { type: Type.STRING },
-                  whereToObtain: { type: Type.STRING },
-                },
-                required: ['documentName', 'purpose', 'whereToObtain'],
-              },
-            },
-            importantConsiderations: {
-              type: Type.OBJECT,
-              properties: {
-                deadlines: { type: Type.ARRAY, items: { type: Type.STRING } },
-                jurisdictionNotes: { type: Type.STRING },
-                uncertaintyFactors: { type: Type.ARRAY, items: { type: Type.STRING } },
-              },
-              required: ['deadlines', 'jurisdictionNotes', 'uncertaintyFactors'],
-            },
-            sources: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  provision: { type: Type.STRING },
-                  url: { type: Type.STRING },
-                  note: { type: Type.STRING },
-                },
-                required: ['name', 'provision', 'url', 'note'],
-              },
-            },
-            disclaimer: { type: Type.STRING },
+            required: [
+              'understanding',
+              'relevantLegalConcepts',
+              'possibleNextSteps',
+              'documentsToCollect',
+              'importantConsiderations',
+              'sources',
+              'disclaimer',
+            ],
           },
-          required: [
-            'understanding',
-            'relevantLegalConcepts',
-            'possibleNextSteps',
-            'documentsToCollect',
-            'importantConsiderations',
-            'sources',
-            'disclaimer',
-          ],
         },
-      },
+      });
     });
 
     const parsed = JSON.parse(response.text || '{}') as AssistantChatResponse;
+    assistantCache.set(cacheKey, parsed);
+    Metrics.recordAICall(Date.now() - startTime, false);
     return parsed;
   } catch (err) {
     console.error('[AIService] chatLegalAssistant fallback triggered:', err);
+    Metrics.recordAICall(Date.now() - startTime, false, true);
     // Safe structured fallback
     return generateAssistantFallback(question, jurisdiction, verifiedSources);
   }
@@ -253,10 +367,26 @@ export async function analyzeLegalDocument(
   jurisdiction: string = 'India'
 ): Promise<DocumentAnalysisResponse> {
   const verifiedSources = getSourcesForQuery(jurisdiction);
+  // Hash document text to deduplicate repeated analysis of the same document
+  const cacheKey = ResponseCache.generateKey('doc_analyze', { filename, jurisdiction, docHash: documentText });
+
+  const cached = documentAnalysisCache.get(cacheKey);
+  if (cached) {
+    Metrics.recordAICall(0, true);
+    return cached;
+  }
+
+  const startTime = Date.now();
+
   const sourcesSummary = verifiedSources
     .slice(0, 3)
     .map((s) => `- ${s.name}: ${s.url}`)
     .join('\n');
+
+  // Token optimization: bound document text to top high-signal characters if exceptionally large
+  const boundedText = documentText.length > CONFIG.MAX_DOCUMENT_ANALYSIS_CHARS
+    ? documentText.substring(0, CONFIG.MAX_DOCUMENT_ANALYSIS_CHARS) + '\n[...remaining sections summarized for analysis...]'
+    : documentText;
 
   const prompt = `
 JURISDICTION: ${jurisdiction}
@@ -266,7 +396,7 @@ AVAILABLE OFFICIAL SOURCES:
 ${sourcesSummary}
 
 <untrusted_document_content>
-${documentText}
+${boundedText}
 </untrusted_document_content>
 
 Analyze the untrusted document above thoroughly.
@@ -281,113 +411,118 @@ Analyze the untrusted document above thoroughly.
 `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: CONFIG.DEFAULT_MODEL,
-      contents: prompt,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION_CORE,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            summary: { type: Type.STRING },
-            documentType: { type: Type.STRING },
-            governingLaw: { type: Type.STRING },
-            keyClauses: {
-              type: Type.ARRAY,
-              items: {
+    const response = await callGeminiWithTimeout(async () => {
+      return await ai.models.generateContent({
+        model: CONFIG.DEFAULT_MODEL,
+        contents: prompt,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION_CORE,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              summary: { type: Type.STRING },
+              documentType: { type: Type.STRING },
+              governingLaw: { type: Type.STRING },
+              keyClauses: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    clauseTitle: { type: Type.STRING },
+                    label: { type: Type.STRING },
+                    originalSnippet: { type: Type.STRING },
+                    plainEnglishMeaning: { type: Type.STRING },
+                    riskLevel: { type: Type.STRING },
+                  },
+                  required: ['clauseTitle', 'label', 'originalSnippet', 'plainEnglishMeaning', 'riskLevel'],
+                },
+              },
+              importantDates: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    dateOrTimeframe: { type: Type.STRING },
+                    obligationOrMilestone: { type: Type.STRING },
+                    consequenceOfMissing: { type: Type.STRING },
+                  },
+                  required: ['dateOrTimeframe', 'obligationOrMilestone', 'consequenceOfMissing'],
+                },
+              },
+              parties: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    name: { type: Type.STRING },
+                    role: { type: Type.STRING },
+                    primaryObligations: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  },
+                  required: ['name', 'role', 'primaryObligations'],
+                },
+              },
+              mutualObligations: {
                 type: Type.OBJECT,
                 properties: {
-                  clauseTitle: { type: Type.STRING },
-                  label: { type: Type.STRING },
-                  originalSnippet: { type: Type.STRING },
-                  plainEnglishMeaning: { type: Type.STRING },
-                  riskLevel: { type: Type.STRING },
+                  userObligations: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  counterpartyObligations: { type: Type.ARRAY, items: { type: Type.STRING } },
                 },
-                required: ['clauseTitle', 'label', 'originalSnippet', 'plainEnglishMeaning', 'riskLevel'],
+                required: ['userObligations', 'counterpartyObligations'],
               },
-            },
-            importantDates: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  dateOrTimeframe: { type: Type.STRING },
-                  obligationOrMilestone: { type: Type.STRING },
-                  consequenceOfMissing: { type: Type.STRING },
+              risksAndAttentionPoints: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    riskTitle: { type: Type.STRING },
+                    severity: { type: Type.STRING },
+                    description: { type: Type.STRING },
+                    mitigationTip: { type: Type.STRING },
+                  },
+                  required: ['riskTitle', 'severity', 'description', 'mitigationTip'],
                 },
-                required: ['dateOrTimeframe', 'obligationOrMilestone', 'consequenceOfMissing'],
               },
-            },
-            parties: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  role: { type: Type.STRING },
-                  primaryObligations: { type: Type.ARRAY, items: { type: Type.STRING } },
+              questionsForLawyer: { type: Type.ARRAY, items: { type: Type.STRING } },
+              sources: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    name: { type: Type.STRING },
+                    provision: { type: Type.STRING },
+                    url: { type: Type.STRING },
+                  },
+                  required: ['name', 'provision', 'url'],
                 },
-                required: ['name', 'role', 'primaryObligations'],
               },
+              disclaimer: { type: Type.STRING },
             },
-            mutualObligations: {
-              type: Type.OBJECT,
-              properties: {
-                userObligations: { type: Type.ARRAY, items: { type: Type.STRING } },
-                counterpartyObligations: { type: Type.ARRAY, items: { type: Type.STRING } },
-              },
-              required: ['userObligations', 'counterpartyObligations'],
-            },
-            risksAndAttentionPoints: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  riskTitle: { type: Type.STRING },
-                  severity: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  mitigationTip: { type: Type.STRING },
-                },
-                required: ['riskTitle', 'severity', 'description', 'mitigationTip'],
-              },
-            },
-            questionsForLawyer: { type: Type.ARRAY, items: { type: Type.STRING } },
-            sources: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  provision: { type: Type.STRING },
-                  url: { type: Type.STRING },
-                },
-                required: ['name', 'provision', 'url'],
-              },
-            },
-            disclaimer: { type: Type.STRING },
+            required: [
+              'summary',
+              'documentType',
+              'governingLaw',
+              'keyClauses',
+              'importantDates',
+              'parties',
+              'mutualObligations',
+              'risksAndAttentionPoints',
+              'questionsForLawyer',
+              'sources',
+              'disclaimer',
+            ],
           },
-          required: [
-            'summary',
-            'documentType',
-            'governingLaw',
-            'keyClauses',
-            'importantDates',
-            'parties',
-            'mutualObligations',
-            'risksAndAttentionPoints',
-            'questionsForLawyer',
-            'sources',
-            'disclaimer',
-          ],
         },
-      },
+      });
     });
 
     const parsed = JSON.parse(response.text || '{}') as DocumentAnalysisResponse;
+    documentAnalysisCache.set(cacheKey, parsed);
+    Metrics.recordAICall(Date.now() - startTime, false);
     return parsed;
   } catch (err) {
     console.error('[AIService] analyzeLegalDocument fallback triggered:', err);
+    Metrics.recordAICall(Date.now() - startTime, false, true);
     return generateDocumentAnalysisFallback(documentText, filename, jurisdiction, verifiedSources);
   }
 }
@@ -400,11 +535,24 @@ export async function askDocumentQuestion(
   userQuestion: string,
   jurisdiction: string = 'India'
 ): Promise<{ answer: string; relevantExcerpts: string[]; disclaimer: string }> {
+  // Document Q&A Cache & Context chunking
+  const cacheKey = ResponseCache.generateKey('doc_qa', { question: userQuestion.trim().toLowerCase(), jurisdiction, docHash: documentText.substring(0, 500) });
+  const cached = documentQACache.get(cacheKey);
+  if (cached) {
+    Metrics.recordAICall(0, true);
+    return cached;
+  }
+
+  const startTime = Date.now();
+
+  // Context chunking optimization: extract only relevant excerpts rather than dumping entire 100k char document
+  const { context: relevantContext } = extractRelevantDocumentContext(documentText, userQuestion, 10000);
+
   const prompt = `
 JURISDICTION: ${jurisdiction}
 
 <untrusted_document_content>
-${documentText}
+${relevantContext}
 </untrusted_document_content>
 
 USER QUESTION ABOUT THIS DOCUMENT:
@@ -418,27 +566,33 @@ State clearly that this is general document interpretation and not legal counsel
 `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: CONFIG.DEFAULT_MODEL,
-      contents: prompt,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION_CORE,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            answer: { type: Type.STRING },
-            relevantExcerpts: { type: Type.ARRAY, items: { type: Type.STRING } },
-            disclaimer: { type: Type.STRING },
+    const response = await callGeminiWithTimeout(async () => {
+      return await ai.models.generateContent({
+        model: CONFIG.DEFAULT_MODEL,
+        contents: prompt,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION_CORE,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              answer: { type: Type.STRING },
+              relevantExcerpts: { type: Type.ARRAY, items: { type: Type.STRING } },
+              disclaimer: { type: Type.STRING },
+            },
+            required: ['answer', 'relevantExcerpts', 'disclaimer'],
           },
-          required: ['answer', 'relevantExcerpts', 'disclaimer'],
         },
-      },
+      });
     });
 
-    return JSON.parse(response.text || '{}');
+    const parsed = JSON.parse(response.text || '{}');
+    documentQACache.set(cacheKey, parsed);
+    Metrics.recordAICall(Date.now() - startTime, false);
+    return parsed;
   } catch (err) {
     console.error('[AIService] askDocumentQuestion fallback triggered:', err);
+    Metrics.recordAICall(Date.now() - startTime, false, true);
     return {
       answer: `Based on the provided document text, the terms regarding "${userQuestion}" depend on the written provisions and execution date. Please verify whether the document includes a specific clause addressing this question, or consult a local legal professional for binding contractual advice.`,
       relevantExcerpts: ['[Document excerpt analysis completed]'],
@@ -454,6 +608,15 @@ export async function classifyLegalIssue(
   situationDescription: string,
   jurisdiction: string = 'India'
 ): Promise<IssueClassificationResponse> {
+  const cacheKey = ResponseCache.generateKey('intake', { situation: situationDescription.trim().toLowerCase(), jurisdiction });
+  const cached = issueClassificationCache.get(cacheKey);
+  if (cached) {
+    Metrics.recordAICall(0, true);
+    return cached;
+  }
+
+  const startTime = Date.now();
+
   const prompt = `
 JURISDICTION: ${jurisdiction}
 
@@ -483,65 +646,71 @@ Identify potential applicable statutory frameworks in ${jurisdiction}.
 `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: CONFIG.DEFAULT_MODEL,
-      contents: prompt,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION_CORE,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            category: { type: Type.STRING },
-            specificIssue: { type: Type.STRING },
-            urgencyLevel: { type: Type.STRING },
-            summary: { type: Type.STRING },
-            informationNeeded: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  field: { type: Type.STRING },
-                  question: { type: Type.STRING },
-                  importance: { type: Type.STRING },
+    const response = await callGeminiWithTimeout(async () => {
+      return await ai.models.generateContent({
+        model: CONFIG.DEFAULT_MODEL,
+        contents: prompt,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION_CORE,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              category: { type: Type.STRING },
+              specificIssue: { type: Type.STRING },
+              urgencyLevel: { type: Type.STRING },
+              summary: { type: Type.STRING },
+              informationNeeded: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    field: { type: Type.STRING },
+                    question: { type: Type.STRING },
+                    importance: { type: Type.STRING },
+                  },
+                  required: ['field', 'question', 'importance'],
                 },
-                required: ['field', 'question', 'importance'],
               },
-            },
-            immediateActions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  stepNumber: { type: Type.INTEGER },
-                  action: { type: Type.STRING },
-                  reason: { type: Type.STRING },
+              immediateActions: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    stepNumber: { type: Type.INTEGER },
+                    action: { type: Type.STRING },
+                    reason: { type: Type.STRING },
+                  },
+                  required: ['stepNumber', 'action', 'reason'],
                 },
-                required: ['stepNumber', 'action', 'reason'],
               },
+              evidenceToPreserve: { type: Type.ARRAY, items: { type: Type.STRING } },
+              potentialApplicableLaws: { type: Type.ARRAY, items: { type: Type.STRING } },
+              jurisdiction: { type: Type.STRING },
             },
-            evidenceToPreserve: { type: Type.ARRAY, items: { type: Type.STRING } },
-            potentialApplicableLaws: { type: Type.ARRAY, items: { type: Type.STRING } },
-            jurisdiction: { type: Type.STRING },
+            required: [
+              'category',
+              'specificIssue',
+              'urgencyLevel',
+              'summary',
+              'informationNeeded',
+              'immediateActions',
+              'evidenceToPreserve',
+              'potentialApplicableLaws',
+              'jurisdiction',
+            ],
           },
-          required: [
-            'category',
-            'specificIssue',
-            'urgencyLevel',
-            'summary',
-            'informationNeeded',
-            'immediateActions',
-            'evidenceToPreserve',
-            'potentialApplicableLaws',
-            'jurisdiction',
-          ],
         },
-      },
+      });
     });
 
-    return JSON.parse(response.text || '{}');
+    const parsed = JSON.parse(response.text || '{}');
+    issueClassificationCache.set(cacheKey, parsed);
+    Metrics.recordAICall(Date.now() - startTime, false);
+    return parsed;
   } catch (err) {
     console.error('[AIService] classifyLegalIssue fallback triggered:', err);
+    Metrics.recordAICall(Date.now() - startTime, false, true);
     return generateClassificationFallback(situationDescription, jurisdiction);
   }
 }

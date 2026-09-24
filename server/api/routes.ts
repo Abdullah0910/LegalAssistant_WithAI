@@ -17,6 +17,8 @@ import {
   sanitizeInput,
   sanitizeFilename,
 } from '../middleware/security.js';
+import { resourcesCache, ResponseCache } from '../services/cacheService.js';
+import { Metrics } from '../services/metrics.js';
 
 export const apiRouter = Router();
 
@@ -30,6 +32,13 @@ apiRouter.get('/health', (req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
   });
+});
+
+/**
+ * Performance & Metrics Observability Endpoint
+ */
+apiRouter.get('/metrics', (req: Request, res: Response) => {
+  res.json(Metrics.getSummary());
 });
 
 /**
@@ -202,13 +211,28 @@ apiRouter.post('/classifier/intake', async (req: Request, res: Response) => {
 apiRouter.get('/resources/list', (req: Request, res: Response) => {
   const jurisdiction = sanitizeInput((req.query.jurisdiction as string) || 'India');
   const category = req.query.category ? sanitizeInput(req.query.category as string) : undefined;
+  const cacheKey = ResponseCache.generateKey('res_list', { jurisdiction, category });
+
+  const cached = resourcesCache.get(cacheKey);
+  if (cached) {
+    res.setHeader('Cache-Control', 'public, max-age=1800, stale-while-revalidate=3600');
+    res.setHeader('X-Cache', 'HIT');
+    res.json(cached);
+    return;
+  }
+
   const sources = getSourcesForQuery(jurisdiction, category);
-  res.json({
+  const payload = {
     jurisdiction,
     category: category || 'All',
     count: sources.length,
     sources,
-  });
+  };
+  resourcesCache.set(cacheKey, payload);
+
+  res.setHeader('Cache-Control', 'public, max-age=1800, stale-while-revalidate=3600');
+  res.setHeader('X-Cache', 'MISS');
+  res.json(payload);
 });
 
 /**
@@ -216,9 +240,24 @@ apiRouter.get('/resources/list', (req: Request, res: Response) => {
  */
 apiRouter.get('/resources/emergencies', (req: Request, res: Response) => {
   const jurisdiction = sanitizeInput((req.query.jurisdiction as string) || 'India');
+  const cacheKey = ResponseCache.generateKey('res_emergencies', { jurisdiction });
+
+  const cached = resourcesCache.get(cacheKey);
+  if (cached) {
+    res.setHeader('Cache-Control', 'public, max-age=1800, stale-while-revalidate=3600');
+    res.setHeader('X-Cache', 'HIT');
+    res.json(cached);
+    return;
+  }
+
   const helplines = getEmergencyHelplines(jurisdiction);
-  res.json({
+  const payload = {
     jurisdiction,
     helplines,
-  });
+  };
+  resourcesCache.set(cacheKey, payload);
+
+  res.setHeader('Cache-Control', 'public, max-age=1800, stale-while-revalidate=3600');
+  res.setHeader('X-Cache', 'MISS');
+  res.json(payload);
 });

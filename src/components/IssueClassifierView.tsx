@@ -19,6 +19,13 @@ interface IssueClassifierViewProps {
   jurisdiction: string;
 }
 
+const SAMPLE_SITUATIONS = [
+  'My employer hasn\'t paid my salary for two months and is refusing to issue my experience letter unless I forfeit my severance.',
+  'My landlord has kept my ₹45,000 security deposit for arbitrary wall painting even though I stayed for 2 years with normal wear and tear.',
+  'I purchased an air conditioner that broke down within 10 days of delivery. The retailer refuses a refund and says parts are out of stock indefinitely.',
+  'An unauthorized micro-lending app is making defamatory calls to my phone contacts claiming I owe a loan I never applied for.',
+] as const;
+
 export const IssueClassifierView: React.FC<IssueClassifierViewProps> = ({ jurisdiction }) => {
   const [step, setStep] = useState<1 | 2>(1);
   const [description, setDescription] = useState('');
@@ -28,13 +35,6 @@ export const IssueClassifierView: React.FC<IssueClassifierViewProps> = ({ jurisd
 
   // User responses to the minimal follow-up questions
   const [followupAnswers, setFollowupAnswers] = useState<Record<string, string>>({});
-
-  const sampleSituations = [
-    'My employer hasn\'t paid my salary for two months and is refusing to issue my experience letter unless I forfeit my severance.',
-    'My landlord has kept my ₹45,000 security deposit for arbitrary wall painting even though I stayed for 2 years with normal wear and tear.',
-    'I purchased an air conditioner that broke down within 10 days of delivery. The retailer refuses a refund and says parts are out of stock indefinitely.',
-    'An unauthorized micro-lending app is making defamatory calls to my phone contacts claiming I owe a loan I never applied for.',
-  ];
 
   const handleClassify = async (overrideText?: string) => {
     const textToUse = (overrideText || description).trim();
@@ -114,7 +114,7 @@ export const IssueClassifierView: React.FC<IssueClassifierViewProps> = ({ jurisd
               Try a Typical Dispute Scenario:
             </span>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {sampleSituations.map((sit, idx) => (
+              {SAMPLE_SITUATIONS.map((sit, idx) => (
                 <button
                   key={idx}
                   onClick={() => handleClassify(sit)}

@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { CONFIG } from '../config.js';
+import { Metrics } from '../services/metrics.js';
 
 // In-memory sliding-window rate limiter
 interface RateLimitRecord {
@@ -100,9 +101,11 @@ export function logSafeRequest(req: Request, res: Response, next: NextFunction):
   res.on('finish', () => {
     const duration = Date.now() - start;
     const status = res.statusCode;
-    // Log safe metadata only: method, path, status, latency
+    // Record lightweight metrics
     if (endpoint.startsWith('/api')) {
-      console.log(`[API] ${method} ${endpoint} - ${status} (${duration}ms)`);
+      const cleanEndpoint = endpoint.split('?')[0];
+      Metrics.recordEndpoint(cleanEndpoint, duration, status >= 400);
+      console.log(`[API] ${method} ${cleanEndpoint} - ${status} (${duration}ms)`);
     }
   });
 

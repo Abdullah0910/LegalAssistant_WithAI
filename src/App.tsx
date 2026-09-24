@@ -1,13 +1,36 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useCallback, Suspense, lazy } from 'react';
 import { Navbar } from './components/Navbar.js';
 import { DisclaimerBanner } from './components/DisclaimerBanner.js';
-import { EmergencyModal } from './components/EmergencyModal.js';
 import { LandingPage } from './components/LandingPage.js';
-import { AssistantView } from './components/AssistantView.js';
-import { DocumentAnalyzerView } from './components/DocumentAnalyzerView.js';
-import { IssueClassifierView } from './components/IssueClassifierView.js';
-import { ResourcesDirectoryView } from './components/ResourcesDirectoryView.js';
-import { Scale, Heart } from 'lucide-react';
+import { Scale, Loader2 } from 'lucide-react';
+
+// Code splitting / Lazy-loaded view components for minimal initial bundle size
+const AssistantView = lazy(() =>
+  import('./components/AssistantView.js').then((m) => ({ default: m.AssistantView }))
+);
+const DocumentAnalyzerView = lazy(() =>
+  import('./components/DocumentAnalyzerView.js').then((m) => ({ default: m.DocumentAnalyzerView }))
+);
+const IssueClassifierView = lazy(() =>
+  import('./components/IssueClassifierView.js').then((m) => ({ default: m.IssueClassifierView }))
+);
+const ResourcesDirectoryView = lazy(() =>
+  import('./components/ResourcesDirectoryView.js').then((m) => ({ default: m.ResourcesDirectoryView }))
+);
+const EmergencyModal = lazy(() =>
+  import('./components/EmergencyModal.js').then((m) => ({ default: m.EmergencyModal }))
+);
+
+const ViewLoadingFallback = () => (
+  <div
+    role="status"
+    aria-live="polite"
+    className="min-h-[400px] flex flex-col items-center justify-center space-y-3 p-8"
+  >
+    <Loader2 className="w-8 h-8 animate-spin text-slate-900" />
+    <span className="text-xs font-semibold text-slate-600">Loading view...</span>
+  </div>
+);
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'overview' | 'assistant' | 'analyzer' | 'intake' | 'resources'>('overview');
@@ -17,7 +40,7 @@ export default function App() {
   const [announcement, setAnnouncement] = useState<string>('Welcome to LegalEase AI. Public legal literacy and access platform.');
 
   // Announce tab changes to screen readers
-  const handleTabChange = (tab: 'overview' | 'assistant' | 'analyzer' | 'intake' | 'resources') => {
+  const handleTabChange = useCallback((tab: 'overview' | 'assistant' | 'analyzer' | 'intake' | 'resources') => {
     setActiveTab(tab);
     const tabLabels: Record<string, string> = {
       overview: 'Navigated to Overview and Home page.',
@@ -27,17 +50,27 @@ export default function App() {
       resources: 'Navigated to Authoritative Legal Sources and Portals.',
     };
     setAnnouncement(tabLabels[tab] || `Switched to ${tab} view.`);
-  };
+  }, []);
 
-  const handleJurisdictionChange = (newJurisdiction: string) => {
+  const handleJurisdictionChange = useCallback((newJurisdiction: string) => {
     setJurisdiction(newJurisdiction);
     setAnnouncement(`Active jurisdiction updated to ${newJurisdiction}. Statutory resources and analysis now reflect ${newJurisdiction} laws.`);
-  };
+  }, []);
 
-  const handleSelectSampleDoc = (docId: string) => {
+  const handleSelectSampleDoc = useCallback((docId: string) => {
     setSelectedSampleDocId(docId);
     handleTabChange('analyzer');
-  };
+  }, [handleTabChange]);
+
+  const handleOpenEmergency = useCallback(() => {
+    setEmergencyModalOpen(true);
+    setAnnouncement('Opened crisis and emergency helplines dialog.');
+  }, []);
+
+  const handleCloseEmergency = useCallback(() => {
+    setEmergencyModalOpen(false);
+    setAnnouncement('Closed emergency helplines dialog.');
+  }, []);
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
@@ -61,23 +94,21 @@ export default function App() {
         setActiveTab={handleTabChange}
         jurisdiction={jurisdiction}
         setJurisdiction={handleJurisdictionChange}
-        onOpenEmergency={() => {
-          setEmergencyModalOpen(true);
-          setAnnouncement('Opened crisis and emergency helplines dialog.');
-        }}
+        onOpenEmergency={handleOpenEmergency}
       />
 
       {/* Emergency Hotline Modal */}
-      <EmergencyModal
-        isOpen={emergencyModalOpen}
-        onClose={() => {
-          setEmergencyModalOpen(false);
-          setAnnouncement('Closed emergency helplines dialog.');
-        }}
-        jurisdiction={jurisdiction}
-      />
+      {emergencyModalOpen && (
+        <Suspense fallback={null}>
+          <EmergencyModal
+            isOpen={emergencyModalOpen}
+            onClose={handleCloseEmergency}
+            jurisdiction={jurisdiction}
+          />
+        </Suspense>
+      )}
 
-      {/* Dynamic View Mount */}
+      {/* Dynamic View Mount with Lazy Suspense Boundaries */}
       <main className="flex-1" id="main-content">
         {activeTab === 'overview' && (
           <LandingPage
@@ -87,31 +118,30 @@ export default function App() {
           />
         )}
 
-        {activeTab === 'assistant' && (
-          <AssistantView
-            jurisdiction={jurisdiction}
-            onOpenEmergency={() => {
-              setEmergencyModalOpen(true);
-              setAnnouncement('Emergency distress dialog opened.');
-            }}
-          />
-        )}
+        <Suspense fallback={<ViewLoadingFallback />}>
+          {activeTab === 'assistant' && (
+            <AssistantView
+              jurisdiction={jurisdiction}
+              onOpenEmergency={handleOpenEmergency}
+            />
+          )}
 
-        {activeTab === 'analyzer' && (
-          <DocumentAnalyzerView
-            jurisdiction={jurisdiction}
-            selectedSampleDocId={selectedSampleDocId}
-            onAnnounce={(msg) => setAnnouncement(msg)}
-          />
-        )}
+          {activeTab === 'analyzer' && (
+            <DocumentAnalyzerView
+              jurisdiction={jurisdiction}
+              selectedSampleDocId={selectedSampleDocId}
+              onAnnounce={(msg) => setAnnouncement(msg)}
+            />
+          )}
 
-        {activeTab === 'intake' && (
-          <IssueClassifierView jurisdiction={jurisdiction} />
-        )}
+          {activeTab === 'intake' && (
+            <IssueClassifierView jurisdiction={jurisdiction} />
+          )}
 
-        {activeTab === 'resources' && (
-          <ResourcesDirectoryView jurisdiction={jurisdiction} />
-        )}
+          {activeTab === 'resources' && (
+            <ResourcesDirectoryView jurisdiction={jurisdiction} />
+          )}
+        </Suspense>
       </main>
 
       {/* Accessible Footer */}
@@ -133,7 +163,7 @@ export default function App() {
             <span>In-Memory Safe Analysis</span>
             <span>·</span>
             <button
-              onClick={() => setEmergencyModalOpen(true)}
+              onClick={handleOpenEmergency}
               className="text-red-600 font-semibold hover:underline"
             >
               Emergency Helplines
