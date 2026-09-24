@@ -17,7 +17,7 @@ import {
   sanitizeInput,
   sanitizeFilename,
 } from '../middleware/security.js';
-import { resourcesCache, ResponseCache } from '../services/cacheService.js';
+import { resourcesCache, documentStore, ResponseCache } from '../services/cacheService.js';
 import { Metrics } from '../services/metrics.js';
 
 export const apiRouter = Router();
@@ -130,7 +130,26 @@ apiRouter.post('/documents/analyze', async (req: Request, res: Response) => {
     }
 
     const analysis = await analyzeLegalDocument(extractedText, safeFilename, safeJurisdiction);
+
+    // Generate deterministic document session ID and pre-chunk sections for instant Q&A retrieval
+    const documentId = ResponseCache.generateKey('doc', {
+      filename: safeFilename,
+      docHash: extractedText.substring(0, 300) + extractedText.length,
+    });
+    const chunks = extractedText.split(/\n\s*\n+/).filter((c) => c.trim().length > 0);
+
+    documentStore.set(documentId, {
+      documentId,
+      filename: safeFilename,
+      text: extractedText,
+      chunks,
+      jurisdiction: safeJurisdiction,
+      wordCount: docMetadata.wordCount || 0,
+      characterCount: docMetadata.characterCount || 0,
+    });
+
     res.json({
+      documentId,
       analysis,
       document: {
         ...docMetadata,
@@ -151,21 +170,41 @@ apiRouter.post('/documents/analyze', async (req: Request, res: Response) => {
  */
 apiRouter.post('/documents/qa', async (req: Request, res: Response) => {
   try {
-    const { documentText, question: rawQuestion, jurisdiction = 'India' } = req.body || {};
-
-    if (!documentText || typeof documentText !== 'string') {
-      res.status(400).json({ error: 'Bad Request', message: 'Document text context is required.' });
-      return;
-    }
+    const { documentId, documentText: rawDocText, question: rawQuestion, jurisdiction = 'India' } = req.body || {};
 
     if (!rawQuestion || typeof rawQuestion !== 'string' || rawQuestion.trim().length === 0) {
       res.status(400).json({ error: 'Bad Request', message: 'A non-empty question is required.' });
       return;
     }
 
+    let resolvedText = '';
+    let precomputedChunks: string[] | undefined;
+
+    // Flow D Optimization: retrieve from in-memory document store by ID without re-sending full document text over wire
+    if (documentId && typeof documentId === 'string') {
+      const stored = documentStore.get(documentId);
+      if (stored) {
+        resolvedText = stored.text;
+        precomputedChunks = stored.chunks;
+      }
+    }
+
+    // Fallback if client sent raw documentText
+    if (!resolvedText && rawDocText && typeof rawDocText === 'string') {
+      resolvedText = rawDocText;
+    }
+
+    if (!resolvedText) {
+      res.status(400).json({
+        error: 'Bad Request',
+        message: 'Valid documentId or documentText is required to answer questions about the document.',
+      });
+      return;
+    }
+
     const question = sanitizeInput(rawQuestion);
     const safeJurisdiction = sanitizeInput(jurisdiction);
-    const result = await askDocumentQuestion(documentText, question, safeJurisdiction);
+    const result = await askDocumentQuestion(resolvedText, question, safeJurisdiction, precomputedChunks);
 
     res.json(result);
   } catch (err: any) {

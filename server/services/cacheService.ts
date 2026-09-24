@@ -69,9 +69,20 @@ export class ResponseCache<T = any> {
   }
 }
 
+export interface StoredDocument {
+  documentId: string;
+  filename: string;
+  text: string;
+  chunks: string[];
+  jurisdiction: string;
+  wordCount: number;
+  characterCount: number;
+}
+
 // Global caches for safe response reuse
 export const assistantCache = new ResponseCache(CONFIG.CACHE_TTL_MS, 150);
 export const documentAnalysisCache = new ResponseCache(CONFIG.CACHE_TTL_MS, 100);
 export const issueClassificationCache = new ResponseCache(CONFIG.CACHE_TTL_MS, 150);
 export const documentQACache = new ResponseCache(CONFIG.CACHE_TTL_MS, 200);
 export const resourcesCache = new ResponseCache(CONFIG.CACHE_TTL_MS * 2, 50); // 1 hr for static official portals
+export const documentStore = new ResponseCache<StoredDocument>(CONFIG.CACHE_TTL_MS * 2, 50); // In-memory session document context store for Flow D Q&A

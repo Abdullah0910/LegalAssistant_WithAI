@@ -129,4 +129,39 @@ describe('Unit Tests: Efficiency, Cache & Performance Observability', () => {
     expect(res.context.length).toBeLessThanOrEqual(4500);
     expect(res.context.toLowerCase()).toContain('security deposit');
   });
+
+  it('should store document in documentStore and reuse precomputed chunks for Flow D follow-up inquiries', async () => {
+    const { documentStore, ResponseCache } = await import('../server/services/cacheService.js');
+    const docId = ResponseCache.generateKey('doc_test', { name: 'sample.txt' });
+    const chunks = ['Clause 1: Term', 'Clause 2: Deposit of INR 50000', 'Clause 3: Notice 30 days'];
+
+    documentStore.set(docId, {
+      documentId: docId,
+      filename: 'sample.txt',
+      text: chunks.join('\n\n'),
+      chunks,
+      jurisdiction: 'India',
+      wordCount: 15,
+      characterCount: 65,
+    });
+
+    const retrieved = documentStore.get(docId);
+    expect(retrieved).not.toBeNull();
+    expect(retrieved?.chunks.length).toBe(3);
+    expect(retrieved?.text).toContain('Deposit of INR 50000');
+  });
+
+  it('should answer follow-up question via askDocumentQuestion using precomputed chunks and cache hit', async () => {
+    const { askDocumentQuestion } = await import('../server/services/aiService.js');
+    const { DEMO_DOCUMENTS } = await import('../src/data/demoDocuments.js');
+    const doc = DEMO_DOCUMENTS[0];
+
+    const res1 = await askDocumentQuestion(doc.content, 'can the landlord deduct painting costs?', 'India');
+    expect(res1).toBeDefined();
+    expect(res1.answer).toContain('wear and tear');
+
+    // Repeated query should hit cache immediately
+    const res2 = await askDocumentQuestion(doc.content, 'can the landlord deduct painting costs?', 'India');
+    expect(res2.answer).toBe(res1.answer);
+  });
 });

@@ -6,6 +6,7 @@ import {
 import { LegalSource, EmergencyResource } from '../../server/services/legalSources.js';
 
 export interface DocumentAnalysisResult {
+  documentId?: string;
   analysis: DocumentAnalysisResponse;
   document: {
     filename: string;
@@ -126,15 +127,28 @@ export const api = {
   },
 
   /**
-   * Ask follow-up question grounded strictly in document text
+   * Ask follow-up question grounded strictly in document text (Flow D optimized)
    */
   async askDocumentQA(
-    documentText: string,
-    question: string,
-    jurisdiction: string,
+    paramsOrText:
+      | string
+      | {
+          documentId?: string;
+          documentText?: string;
+          question: string;
+          jurisdiction: string;
+        },
+    question?: string,
+    jurisdiction?: string,
     signal?: AbortSignal
   ): Promise<DocumentQAResult> {
-    const key = `qa:${jurisdiction}:${question.trim().toLowerCase()}:${documentText.substring(0, 80)}`;
+    const isObject = typeof paramsOrText === 'object';
+    const documentId = isObject ? paramsOrText.documentId : undefined;
+    const documentText = isObject ? paramsOrText.documentText : paramsOrText;
+    const q = isObject ? paramsOrText.question : (question || '');
+    const jur = isObject ? paramsOrText.jurisdiction : (jurisdiction || 'India');
+
+    const key = `qa:${jur}:${q.trim().toLowerCase()}:${documentId || (documentText || '').substring(0, 80)}`;
     const cached = getCached<DocumentQAResult>(key);
     if (cached) return cached;
 
@@ -142,7 +156,13 @@ export const api = {
       const res = await fetch('/api/documents/qa', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ documentText, question, jurisdiction }),
+        // If documentId is present, we only send documentId and do not re-send documentText over the network!
+        body: JSON.stringify({
+          documentId,
+          documentText: documentId ? undefined : documentText,
+          question: q,
+          jurisdiction: jur,
+        }),
         signal,
       });
 

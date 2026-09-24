@@ -56,6 +56,7 @@ export const DocumentAnalyzerView: React.FC<DocumentAnalyzerViewProps> = ({
   const [activeSubTab, setActiveSubTab] = useState<'clauses' | 'dates' | 'obligations' | 'risks' | 'questions' | 'qa'>('clauses');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<DocumentAnalysisResult | null>(null);
+  const [documentId, setDocumentId] = useState<string | null>(null);
   const [documentText, setDocumentText] = useState('');
   const [filename, setFilename] = useState('');
   const [analysisError, setAnalysisError] = useState<string | null>(null);
@@ -91,6 +92,7 @@ export const DocumentAnalyzerView: React.FC<DocumentAnalyzerViewProps> = ({
         jurisdiction,
       });
       setAnalysisResult(res);
+      setDocumentId(res.documentId || null);
       setQaHistory([]);
       onAnnounce?.(`Document analysis complete for ${doc.title}. Summary, ${res.analysis.keyClauses.length} clauses, and critical dates are ready.`);
     } catch (err: any) {
@@ -127,6 +129,7 @@ export const DocumentAnalyzerView: React.FC<DocumentAnalyzerViewProps> = ({
               jurisdiction,
             });
             setAnalysisResult(res);
+            setDocumentId(res.documentId || null);
             setQaHistory([]);
             onAnnounce?.(`Document analysis complete for ${file.name}. ${res.analysis.keyClauses.length} clauses categorized.`);
           } catch (err: any) {
@@ -151,6 +154,7 @@ export const DocumentAnalyzerView: React.FC<DocumentAnalyzerViewProps> = ({
               jurisdiction,
             });
             setAnalysisResult(res);
+            setDocumentId(res.documentId || null);
             setDocumentText(res.document.previewText);
             setQaHistory([]);
             onAnnounce?.(`Document analysis complete for ${file.name}. ${res.analysis.keyClauses.length} clauses categorized.`);
@@ -174,14 +178,20 @@ export const DocumentAnalyzerView: React.FC<DocumentAnalyzerViewProps> = ({
 
   const handleAskQuestion = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!qaInput.trim() || isQaLoading || !documentText) return;
+    if (!qaInput.trim() || isQaLoading || (!documentId && !documentText)) return;
 
     const q = qaInput.trim();
     setQaInput('');
     setIsQaLoading(true);
 
     try {
-      const res = await api.askDocumentQA(documentText, q, jurisdiction);
+      // Flow D Optimization: pass documentId so the entire document text is never re-transmitted
+      const res = await api.askDocumentQA({
+        documentId: documentId || undefined,
+        documentText: documentId ? undefined : documentText,
+        question: q,
+        jurisdiction,
+      });
       setQaHistory((prev) => [
         ...prev,
         {

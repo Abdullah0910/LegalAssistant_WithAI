@@ -45,8 +45,8 @@ async function callGeminiWithTimeout<T>(
       return await Promise.race([requestFn(), timeoutPromise]);
     } catch (err: any) {
       attempt++;
-      // Only retry once on transient rate limit or 503 errors
-      const isTransient = err?.status === 503 || err?.status === 429 || err?.message?.includes('high demand') || err?.message?.includes('timeout');
+      // Only retry once on transient 503 or transient timeout errors; do not retry hard 429 quota exhaustion
+      const isTransient = (err?.status === 503 || err?.message?.includes('high demand') || err?.message?.includes('timeout')) && err?.status !== 429 && !err?.message?.includes('Quota exceeded');
       if (attempt <= maxRetries && isTransient) {
         const backoffMs = Math.min(400 * Math.pow(1.5, attempt), 1000);
         await new Promise((resolve) => setTimeout(resolve, backoffMs));
@@ -61,7 +61,12 @@ async function callGeminiWithTimeout<T>(
 /**
  * Extract relevant document excerpt for Q&A without sending massive document
  */
-export function extractRelevantDocumentContext(documentText: string, query: string, maxChars: number = 8000): { context: string; isFiltered: boolean } {
+export function extractRelevantDocumentContext(
+  documentText: string,
+  query: string,
+  maxChars: number = 8000,
+  precomputedChunks?: string[]
+): { context: string; isFiltered: boolean } {
   if (documentText.length <= maxChars) {
     return { context: documentText, isFiltered: false };
   }
@@ -72,8 +77,10 @@ export function extractRelevantDocumentContext(documentText: string, query: stri
     .split(/\s+/)
     .filter((w) => w.length > 3 && !['what', 'when', 'where', 'which', 'about', 'does', 'this', 'that', 'have', 'from', 'with'].includes(w));
 
-  // Split document into paragraphs or sections
-  const sections = documentText.split(/\n\s*\n+/);
+  // Split document into paragraphs or use precomputed chunks to eliminate re-parsing overhead
+  const sections = precomputedChunks && precomputedChunks.length > 0
+    ? precomputedChunks
+    : documentText.split(/\n\s*\n+/);
   const scoredSections: Array<{ section: string; score: number; index: number }> = [];
 
   sections.forEach((sec, index) => {
@@ -353,8 +360,10 @@ Include a standard legal information disclaimer.
   } catch (err) {
     console.error('[AIService] chatLegalAssistant fallback triggered:', err);
     Metrics.recordAICall(Date.now() - startTime, false, true);
-    // Safe structured fallback
-    return generateAssistantFallback(question, jurisdiction, verifiedSources);
+    // Safe structured fallback with temporary negative caching to prevent re-bombarding on rate limits
+    const fallback = generateAssistantFallback(question, jurisdiction, verifiedSources);
+    assistantCache.set(cacheKey, fallback, 60000);
+    return fallback;
   }
 }
 
@@ -523,7 +532,9 @@ Analyze the untrusted document above thoroughly.
   } catch (err) {
     console.error('[AIService] analyzeLegalDocument fallback triggered:', err);
     Metrics.recordAICall(Date.now() - startTime, false, true);
-    return generateDocumentAnalysisFallback(documentText, filename, jurisdiction, verifiedSources);
+    const fallback = generateDocumentAnalysisFallback(documentText, filename, jurisdiction, verifiedSources);
+    documentAnalysisCache.set(cacheKey, fallback, 60000);
+    return fallback;
   }
 }
 
@@ -533,10 +544,15 @@ Analyze the untrusted document above thoroughly.
 export async function askDocumentQuestion(
   documentText: string,
   userQuestion: string,
-  jurisdiction: string = 'India'
+  jurisdiction: string = 'India',
+  precomputedChunks?: string[]
 ): Promise<{ answer: string; relevantExcerpts: string[]; disclaimer: string }> {
   // Document Q&A Cache & Context chunking
-  const cacheKey = ResponseCache.generateKey('doc_qa', { question: userQuestion.trim().toLowerCase(), jurisdiction, docHash: documentText.substring(0, 500) });
+  const cacheKey = ResponseCache.generateKey('doc_qa', {
+    question: userQuestion.trim().toLowerCase(),
+    jurisdiction,
+    docHash: documentText.substring(0, 300) + documentText.length,
+  });
   const cached = documentQACache.get(cacheKey);
   if (cached) {
     Metrics.recordAICall(0, true);
@@ -546,7 +562,7 @@ export async function askDocumentQuestion(
   const startTime = Date.now();
 
   // Context chunking optimization: extract only relevant excerpts rather than dumping entire 100k char document
-  const { context: relevantContext } = extractRelevantDocumentContext(documentText, userQuestion, 10000);
+  const { context: relevantContext } = extractRelevantDocumentContext(documentText, userQuestion, 8000, precomputedChunks);
 
   const prompt = `
 JURISDICTION: ${jurisdiction}
@@ -593,11 +609,13 @@ State clearly that this is general document interpretation and not legal counsel
   } catch (err) {
     console.error('[AIService] askDocumentQuestion fallback triggered:', err);
     Metrics.recordAICall(Date.now() - startTime, false, true);
-    return {
+    const fallback = {
       answer: `Based on the provided document text, the terms regarding "${userQuestion}" depend on the written provisions and execution date. Please verify whether the document includes a specific clause addressing this question, or consult a local legal professional for binding contractual advice.`,
       relevantExcerpts: ['[Document excerpt analysis completed]'],
       disclaimer: 'General legal information only. Not a substitute for formal legal representation.',
     };
+    documentQACache.set(cacheKey, fallback, 60000);
+    return fallback;
   }
 }
 
@@ -711,7 +729,9 @@ Identify potential applicable statutory frameworks in ${jurisdiction}.
   } catch (err) {
     console.error('[AIService] classifyLegalIssue fallback triggered:', err);
     Metrics.recordAICall(Date.now() - startTime, false, true);
-    return generateClassificationFallback(situationDescription, jurisdiction);
+    const fallback = generateClassificationFallback(situationDescription, jurisdiction);
+    issueClassificationCache.set(cacheKey, fallback, 60000);
+    return fallback;
   }
 }
 

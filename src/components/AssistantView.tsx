@@ -85,7 +85,7 @@ export const AssistantView: React.FC<AssistantViewProps> = ({ jurisdiction, onOp
 
     try {
       const historyPayload = messages
-        .filter((m) => m.text)
+        .filter((m) => m.text && m.id !== 'welcome-msg')
         .slice(-2)
         .map((m) => ({
           role: m.sender === 'user' ? ('user' as const) : ('assistant' as const),
