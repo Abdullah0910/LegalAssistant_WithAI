@@ -1,0 +1,6 @@
+{
+  "name": "LegalEase AI",
+  "description": "Accessible, production-grade AI legal assistance platform providing plain-English document analysis, guided legal issue intake, rights exploration, checklists, and authoritative statutory resources.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
